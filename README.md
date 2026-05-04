@@ -1,6 +1,6 @@
 # gauge-lib
 
-Shared library for the NeurIPS 2026 paper *Gauge-Fixed Energy Control for
+Shared library for *Gauge-Fixed Energy Control for
 Proposal Composition*. Used by all experiment notebooks (synthetic, attention,
 MoE, GNN) to keep controller variants, gauge interventions, and the storage
 schema consistent across testbeds.
