@@ -35,8 +35,10 @@ Conventions
   vector; leading axes are batch/token/example.
 - Scalars (``s``, ``a``, ``m``) have shape ``(...)`` matching the leading
   axes of ``z``. They are broadcast by unsqueezing the trailing dim.
-- All penalties are returned as scalar tensors averaged over leading axes.
-  The caller is responsible for summing across multiple controllers.
+- By default penalties are returned as scalar tensors averaged over leading axes.
+  For structured modules, ``Controller`` also supports summing specified
+  leading axes before averaging (for example, sum over heads and average over
+  batch/query positions).
 """
 
 from __future__ import annotations
@@ -47,7 +49,7 @@ import random
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -89,6 +91,51 @@ def safe_normalize(z: Tensor, eps: float = EPS) -> Tuple[Tensor, Tensor]:
     return d, z_norm.squeeze(-1)
 
 
+def reduce_penalty_energy(
+    energy: Tensor,
+    *,
+    reduction: str = "mean",
+    sum_dims: Optional[Sequence[int]] = None,
+) -> Tensor:
+    """Reduce a nonnegative per-item energy tensor to a scalar penalty.
+
+    Parameters
+    ----------
+    energy:
+        Tensor of squared quantities such as ``m**2`` or ``||e||**2``.
+        Its axes are the leading axes of a displacement tensor.
+    reduction:
+        ``"mean"`` averages all entries after any requested summation.
+        ``"sum"`` sums all entries after any requested summation.
+    sum_dims:
+        Optional axes to sum before the final reduction.  This is useful when
+        the theoretical energy for one example/query is a sum over components,
+        e.g. ``lambda * sum_h m_{b,h,q}^2`` followed by a mean over ``b,q``.
+
+    Examples
+    --------
+    For ``m`` with shape ``(B,H,K)``, use
+    ``reduce_penalty_energy(m.pow(2), sum_dims=(1,))`` to compute
+    ``m.pow(2).sum(dim=1).mean()``.
+    """
+    if sum_dims is not None:
+        dims = tuple(int(d) for d in sum_dims)
+        # Normalize negative dims and sum from largest to smallest so indices
+        # remain valid after each reduction.
+        ndim = energy.dim()
+        dims = tuple(sorted({d if d >= 0 else ndim + d for d in dims}, reverse=True))
+        for d in dims:
+            if d < 0 or d >= energy.dim():
+                raise ValueError(f"sum_dim {d} out of range for energy shape {tuple(energy.shape)}")
+            energy = energy.sum(dim=d)
+
+    if reduction == "mean":
+        return energy.mean()
+    if reduction == "sum":
+        return energy.sum()
+    raise ValueError(f"reduction must be 'mean' or 'sum', got {reduction!r}")
+
+
 # ---------------------------------------------------------------------------
 # Controller
 # ---------------------------------------------------------------------------
@@ -127,6 +174,14 @@ class Controller(nn.Module):
         The fixed ``m`` used in ``dir_norm`` mode. Ignored otherwise.
     eps : float
         Numerical floor for ``||z||`` in normalization.
+    penalty_reduction : str
+        Final scalar reduction for the per-item penalty energy. Defaults to
+        ``"mean"`` for backward compatibility.
+    penalty_sum_dims : sequence of int, optional
+        Leading axes to sum before the final reduction. For attention with
+        per-head magnitudes of shape ``(B,H,K)``, ``penalty_sum_dims=(1,)``
+        makes the energy ``lambda * sum_h m_{b,h,k}^2`` averaged over
+        batch/query positions.
 
     Notes
     -----
@@ -148,6 +203,8 @@ class Controller(nn.Module):
         lam: float = 0.0,
         fixed_magnitude: float = 1.0,
         eps: float = EPS,
+        penalty_reduction: str = "mean",
+        penalty_sum_dims: Optional[Sequence[int]] = None,
     ):
         super().__init__()
         if mode not in ALL_MODES:
@@ -156,11 +213,23 @@ class Controller(nn.Module):
         self.lam = float(lam)
         self.fixed_magnitude = float(fixed_magnitude)
         self.eps = eps
+        self.penalty_reduction = penalty_reduction
+        self.penalty_sum_dims = None if penalty_sum_dims is None else tuple(penalty_sum_dims)
 
     # ------------------------------------------------------------------ utils
 
     def extra_repr(self) -> str:
-        return f"mode={self.mode!r}, lam={self.lam}, fixed_magnitude={self.fixed_magnitude}"
+        return (f"mode={self.mode!r}, lam={self.lam}, "
+                f"fixed_magnitude={self.fixed_magnitude}, "
+                f"penalty_reduction={self.penalty_reduction!r}, "
+                f"penalty_sum_dims={self.penalty_sum_dims}")
+
+    def _penalty(self, energy: Tensor, z: Tensor) -> Tensor:
+        if not self.lam:
+            return z.new_zeros(())
+        return self.lam * reduce_penalty_energy(
+            energy, reduction=self.penalty_reduction, sum_dims=self.penalty_sum_dims
+        )
 
     # ----------------------------------------------------------------- forward
 
@@ -212,7 +281,7 @@ class Controller(nn.Module):
             e = s_b * d
             a = torch.ones_like(s)
             m = s
-            penalty = self.lam * (m.pow(2)).mean() if self.lam else z.new_zeros(())
+            penalty = self._penalty(m.pow(2), z)
             return e, ControllerInfo(a=a, z_norm=z_norm, e_norm=m, m=m, d=d, penalty=penalty)
 
         # Amplitude variants: e = s * z
@@ -224,11 +293,11 @@ class Controller(nn.Module):
         if self.mode == "none":
             penalty = z.new_zeros(())
         elif self.mode == "amp_only":
-            penalty = self.lam * (a.pow(2)).mean() if self.lam else z.new_zeros(())
+            penalty = self._penalty(a.pow(2), z)
         elif self.mode == "agg_only":
-            penalty = self.lam * (z_norm.pow(2)).mean() if self.lam else z.new_zeros(())
+            penalty = self._penalty(z_norm.pow(2), z)
         elif self.mode == "raw_disp":
-            penalty = self.lam * (e_norm.pow(2)).mean() if self.lam else z.new_zeros(())
+            penalty = self._penalty(e_norm.pow(2), z)
         else:  # pragma: no cover
             raise AssertionError(f"unreachable mode {self.mode!r}")
 
@@ -380,6 +449,153 @@ def predict_e_quad_hvp(
         "reason": "tol" if converged else "max_iter",
         "residual": (r.norm() / b_norm).item(),
     }
+
+
+def predict_e_quad_batch(H: Tensor, g: Tensor, lam: float, metric: Optional[Tensor] = None) -> Tensor:
+    """Curvature-corrected prediction for batched gradients and a shared Hessian.
+
+    Solves ``(H + 2*lambda*M) e = -g`` where ``M`` is the metric used by the
+    quadratic energy.  If ``metric`` is omitted, ``M=I``.  ``g`` may have shape
+    ``(..., n)`` and ``H``/``metric`` have shape ``(n, n)``.
+    """
+    if lam <= 0:
+        raise ValueError(f"lam must be positive, got {lam}")
+    if H.dim() != 2 or H.shape[0] != H.shape[1]:
+        raise ValueError(f"H must be square 2D, got shape {tuple(H.shape)}")
+    n = H.shape[0]
+    if g.shape[-1] != n:
+        raise ValueError(f"g last dim must match H, got g={tuple(g.shape)} H={tuple(H.shape)}")
+    M = torch.eye(n, device=H.device, dtype=H.dtype) if metric is None else metric.to(device=H.device, dtype=H.dtype)
+    if M.shape != H.shape:
+        raise ValueError(f"metric must have shape {tuple(H.shape)}, got {tuple(M.shape)}")
+    A = 0.5 * (H + H.transpose(-1, -2)) + 2.0 * lam * 0.5 * (M + M.transpose(-1, -2))
+    flat_g = g.reshape(-1, n)
+    sol = torch.linalg.solve(A, (-flat_g).T).T
+    return sol.reshape_as(g)
+
+
+def solve_nonnegative_quadratic_subspace(
+    g: Tensor,
+    H: Tensor,
+    directions: Tensor,
+    lam: float,
+    penalty_metric: Optional[Tensor] = None,
+    nonnegative: bool = True,
+    eps: float = EPS,
+) -> Tuple[Tensor, Tensor, Dict[str, Any]]:
+    """Solve a small capacity-limited quadratic prediction over magnitudes.
+
+    The feasible displacement is ``e = sum_j m_j directions[j]``.  For each
+    leading-axis item, this solves
+
+    ``0.5 e^T H e + g^T e + lambda * m^T R m``
+
+    where ``R = I`` by default.  If ``penalty_metric`` is supplied, the penalty
+    is instead ``lambda * e^T penalty_metric e``, so
+    ``R = directions @ penalty_metric @ directions.T``.
+
+    Parameters
+    ----------
+    g:
+        Gradient tensor with shape ``(..., n)``.
+    H:
+        Shared Hessian with shape ``(n, n)``.
+    directions:
+        Feasible unit directions with shape ``(..., k, n)``.  The leading axes
+        must match ``g.shape[:-1]``.  ``k`` should be small; when
+        ``nonnegative=True`` the active-set solver enumerates all subsets.
+    lam:
+        Energy coefficient.
+    penalty_metric:
+        Optional metric ``M`` for a pullback energy ``lambda * e^T M e``.
+    nonnegative:
+        If true, constrain ``m_j >= 0`` by exact active-set enumeration.
+
+    Returns
+    -------
+    m:
+        Optimal magnitudes with shape ``(..., k)``.
+    e:
+        Predicted displacement with shape ``(..., n)``.
+    info:
+        Dictionary with active-set diagnostics.
+    """
+    if lam <= 0:
+        raise ValueError(f"lam must be positive, got {lam}")
+    if H.dim() != 2 or H.shape[0] != H.shape[1]:
+        raise ValueError(f"H must be square 2D, got shape {tuple(H.shape)}")
+    if directions.dim() < 2:
+        raise ValueError("directions must have shape (..., k, n)")
+    if g.shape[:-1] != directions.shape[:-2] or g.shape[-1] != directions.shape[-1]:
+        raise ValueError(f"g shape {tuple(g.shape)} incompatible with directions {tuple(directions.shape)}")
+
+    *lead, k, n = directions.shape
+    if H.shape != (n, n):
+        raise ValueError(f"H shape {tuple(H.shape)} incompatible with n={n}")
+
+    Hs = 0.5 * (H + H.T).to(device=directions.device, dtype=directions.dtype)
+    if penalty_metric is None:
+        Ms = None
+    else:
+        Ms = 0.5 * (penalty_metric + penalty_metric.T).to(device=directions.device, dtype=directions.dtype)
+        if Ms.shape != (n, n):
+            raise ValueError(f"penalty_metric shape {tuple(Ms.shape)} incompatible with n={n}")
+
+    dirs = directions.reshape(-1, k, n)
+    gf = g.reshape(-1, n).to(device=directions.device, dtype=directions.dtype)
+    out_m = torch.zeros(dirs.shape[0], k, device=directions.device, dtype=directions.dtype)
+    active_sizes: List[int] = []
+    obj_vals: List[float] = []
+
+    # Precompute all nonempty masks for exact active-set enumeration.  k is
+    # small for attention heads (e.g. k=4) or post-WO scalar direction (k=1).
+    masks: List[List[int]]
+    if nonnegative:
+        masks = [[j for j in range(k) if (mask >> j) & 1] for mask in range(1, 1 << k)]
+    else:
+        masks = [list(range(k))]
+
+    for i in range(dirs.shape[0]):
+        Di = dirs[i]                                      # (k,n), rows are directions
+        gi = gf[i]                                        # (n,)
+        Q = Di @ Hs @ Di.T                                # (k,k)
+        if Ms is None:
+            R = torch.eye(k, device=Di.device, dtype=Di.dtype)
+        else:
+            R = Di @ Ms @ Di.T
+        A = Q + 2.0 * lam * R
+        b = Di @ gi                                       # linear term b^T m
+
+        best_m = torch.zeros(k, device=Di.device, dtype=Di.dtype)
+        best_obj = torch.tensor(0.0, device=Di.device, dtype=Di.dtype)  # m=0 is feasible
+        best_size = 0
+
+        for active in masks:
+            idx = torch.tensor(active, device=Di.device, dtype=torch.long)
+            Aaa = A.index_select(0, idx).index_select(1, idx)
+            ba = b.index_select(0, idx)
+            # Tiny ridge protects against rank-deficient direction sets.
+            ridge = eps * torch.eye(len(active), device=Di.device, dtype=Di.dtype)
+            try:
+                ma = torch.linalg.solve(Aaa + ridge, -ba)
+            except RuntimeError:
+                ma = torch.linalg.lstsq(Aaa + ridge, -ba).solution
+            if nonnegative and bool((ma < -1e-8).any()):
+                continue
+            m_full = torch.zeros(k, device=Di.device, dtype=Di.dtype)
+            m_full.index_copy_(0, idx, ma.clamp_min(0.0) if nonnegative else ma)
+            obj = 0.5 * m_full @ Q @ m_full + b @ m_full + lam * (m_full @ R @ m_full)
+            if obj < best_obj:
+                best_obj = obj
+                best_m = m_full
+                best_size = len(active)
+
+        out_m[i] = best_m
+        active_sizes.append(best_size)
+        obj_vals.append(float(best_obj.detach().cpu()))
+
+    e = torch.einsum("bkn,bk->bn", dirs, out_m).reshape(*lead, n)
+    return out_m.reshape(*lead, k), e, {"active_size": np.asarray(active_sizes), "objective": np.asarray(obj_vals)}
 
 
 def predict_e_proj(
@@ -685,7 +901,16 @@ def _self_test() -> None:
         _, info = ctrl(z, s)
         assert math.isclose(info.penalty.item(), expected[mode], rel_tol=1e-5, abs_tol=1e-7), \
             f"{mode}: penalty {info.penalty.item()} vs expected {expected[mode]}"
-    print("  [ok] Penalty formulas")
+    # Structured reduction: sum over H then mean over B,K.
+    m3 = torch.ones(2, 3, 4)
+    red = reduce_penalty_energy(m3.pow(2), sum_dims=(1,))
+    assert math.isclose(red.item(), 3.0, rel_tol=1e-6), red.item()
+    ctrl_struct = Controller(mode="gauge_fixed", lam=0.1, penalty_sum_dims=(1,))
+    z3 = torch.randn(2, 3, 4, 5)
+    s3 = torch.ones(2, 3, 4)
+    _, info3 = ctrl_struct(z3, s3)
+    assert math.isclose(info3.penalty.item(), 0.3, rel_tol=1e-5), info3.penalty.item()
+    print("  [ok] Penalty formulas and structured reduction")
 
     # ---- 3. Exact gauge invariance for amplitude variants ----
     # Apply (a, z) -> (c^{-1} a, c z); check e is preserved for amp variants.
@@ -748,6 +973,17 @@ def _self_test() -> None:
         ratio = (2 * lam * m / g.norm()).item()
         assert math.isclose(ratio, 1.0, rel_tol=1e-5), f"2*lam*m/||g|| = {ratio} for lam={lam}"
     print("  [ok] 2 lambda m / ||g|| = 1 in linearized regime")
+
+    # ---- 6b. Nonnegative subspace solver matches a simple closed-form case ----
+    H0 = torch.eye(2)
+    g0 = torch.tensor([-2.0, 1.0])
+    dirs0 = torch.eye(2).unsqueeze(0)  # two coordinate directions
+    m_sub, e_sub, info_sub = solve_nonnegative_quadratic_subspace(g0.unsqueeze(0), H0, dirs0, lam=0.5)
+    # Objective: 0.5||e||^2 + g^T e + 0.5||m||^2 -> m1=1, m2=0
+    torch.testing.assert_close(m_sub.squeeze(0), torch.tensor([1.0, 0.0]), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(e_sub.squeeze(0), torch.tensor([1.0, 0.0]), rtol=1e-5, atol=1e-6)
+    assert int(info_sub["active_size"][0]) == 1
+    print("  [ok] nonnegative quadratic subspace solver")
 
     # ---- 7. RunLogger round-trip ----
     import tempfile
