@@ -241,18 +241,21 @@ class Controller(nn.Module):
 
 
 def apply_gauge_traversal(
-    model: nn.Module,
     c: float,
-    scale_amp_fn: Callable[[nn.Module, float], None],
-    scale_agg_fn: Callable[[nn.Module, float], None],
+    scale_amp_fn: Callable[[float], None],
+    scale_agg_fn: Callable[[float], None],
 ) -> None:
     """
     Apply the gauge transformation ``(a, z) -> (c^{-1} a, c * z)`` in place.
 
-    The two scaling functions are testbed-specific. For the exact-synthetic
-    testbed they multiply the amplitude parameter and the aggregate weight
-    matrix; for attention / MoE / GNN they encapsulate the chosen amplitude
-    channel and the upstream aggregate scaling. See Section 2.1
+    The two scaling functions are testbed-specific and should mutate the
+    model's parameters. Typically the caller passes bound methods on the
+    model (e.g. ``model.scale_amp`` and ``model.scale_agg``) which take a
+    single ``factor`` argument and apply it to the relevant parameters.
+
+    For the exact-synthetic testbed both functions multiply parameters
+    directly. For attention / MoE / GNN they encapsulate the chosen
+    amplitude channel and the upstream aggregate scaling. See Section 2.1
     "Architectural scope" in the paper for what counts as a valid local
     gauge realization.
 
@@ -263,8 +266,8 @@ def apply_gauge_traversal(
     """
     if c <= 0:
         raise ValueError(f"c must be positive, got {c}")
-    scale_amp_fn(model, 1.0 / c)
-    scale_agg_fn(model, c)
+    scale_amp_fn(1.0 / c)
+    scale_agg_fn(c)
 
 
 def delta_gauge(e_before: Tensor, e_after: Tensor) -> Tensor:
